@@ -2,7 +2,7 @@ services:
   mailer:
     # build: .
     # Or use a prebuilt image instead of build:
-    image: ghcr.io/ReCloudStudio/mailer:latest
+    image: ghcr.io/recloudstudio/mailer:latest
     container_name: mailer
     restart: unless-stopped
     volumes:
