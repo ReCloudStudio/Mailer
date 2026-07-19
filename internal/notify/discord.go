@@ -39,7 +39,8 @@ type Discord struct {
 }
 
 // NewDiscord builds a Discord notifier. The accounts slice is used to resolve
-// per-account channel/thread routing.
+// per-account channel/thread routing. If a bot token is configured, a Gateway
+// connection is started in the background to show the bot as online.
 func NewDiscord(cfg config.Discord, accounts []config.Account) (*Discord, error) {
 	d := &Discord{
 		botToken: cfg.BotToken,
@@ -58,6 +59,11 @@ func NewDiscord(cfg config.Discord, accounts []config.Account) (*Discord, error)
 		}
 		d.routes[a.Name] = dest
 	}
+
+	if cfg.BotToken != "" {
+		startGateway(context.Background(), cfg.BotToken)
+	}
+
 	return d, nil
 }
 
