@@ -1,0 +1,6 @@
+/mailer
+config.yaml
+state.db
+state.db-shm
+state.db-wal
+data/

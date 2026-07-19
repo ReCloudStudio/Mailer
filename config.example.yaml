@@ -1,0 +1,81 @@
+# How often to check every account for new mail (Go duration: 30s, 1m, 5m...).
+poll_interval: 60s
+
+# SQLite database used to remember which mail has already been notified.
+# When running in Docker, point this at the mounted data volume, e.g.:
+#   state_file: /app/data/state.db
+state_file: state.db
+
+# HTTP health check and metrics server port. Set to 0 to disable.
+health_port: 9100
+
+# Notification retry: attempts (excluding first try) and base backoff delay.
+retry_attempts: 2
+retry_delay: 5s
+
+# IMAP NOOP keepalive interval. Pooled connections send NOOP at this rate
+# to prevent server-side timeouts.
+noop_interval: 30s
+
+# One or more IMAP mailboxes to watch. Add as many accounts as you like.
+accounts:
+  - name: primary                # label shown in notifications/logs
+    host: imap.example.com
+    port: 993                     # 993 = implicit TLS, 143 = STARTTLS
+    username: me@example.com
+    password: "app-password-here"
+    tls: true                     # true = implicit TLS (993); false = STARTTLS (143)
+    mailbox: INBOX
+    mark_seen: false              # true = mark mail \Seen after notifying
+    notify_existing: false        # false = only notify mail arriving after startup
+    # notifiers: [telegram]        # optional: override global notifiers per account
+    # message_template:            # optional: per-account message template
+    #   title: "{{.Subject}}"
+    #   text: "From: {{.From}}\n{{.Preview}}"
+    # password_file: /run/secrets/imap_pass    # read password from file (age/gpg/any)
+    #                                          # also supports $ENV_VAR expansion
+
+  - name: work                    # a second account (Office 365 example)
+    host: outlook.office365.com
+    port: 993
+    username: me@work.com
+    password: "app-password"
+    tls: true
+
+  - name: gmail                   # a third account (Gmail example)
+    host: imap.gmail.com
+    port: 993
+    username: me@gmail.com
+    password: "app-password"      # Gmail requires an App Password
+    tls: true
+    mailbox: INBOX
+
+# Telegram push via a bot. Create a bot with @BotFather to get the token,
+# then get your chat_id (e.g. message the bot and read getUpdates).
+telegram:
+  enabled: true
+  bot_token: "123456789:ABCdefGhIJKlmNoPQRsTUVwxyz"  # or bot_token_file
+  # bot_token_file: /run/secrets/telegram_token
+  chat_ids:
+    - "123456789"
+  # api_base: "https://api.telegram.org"   # override for a proxy if needed
+
+# Discord push. Use EITHER a webhook_url (simplest) OR bot_token + channel_id.
+discord:
+  enabled: false
+  webhook_url: "https://discord.com/api/webhooks/XXXX/YYYY"
+  # webhook_url_file: /run/secrets/discord_webhook
+  bot_token: ""
+  # bot_token_file: /run/secrets/discord_token
+  channel_id: ""
+
+# Optional global message template overrides. Each field is a Go text/template
+# string executed against the Message struct. Per-account templates take
+# precedence when set.
+# message_template:
+#   title: "{{.Subject}}"
+#   text: |
+#     📬 New mail on {{.Account}}
+#     From: {{.From}}
+#     Subject: {{.Subject}}
+#     {{if .Preview}}{{.Preview}}{{end}}

@@ -1,0 +1,12 @@
+.git
+.gitignore
+mailer
+state.db
+state.db-shm
+state.db-wal
+data/
+config.yaml
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore

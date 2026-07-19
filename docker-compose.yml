@@ -1,0 +1,15 @@
+services:
+  mailer:
+    # build: .
+    # Or use a prebuilt image instead of build:
+    image: ghcr.io/ReCloudStudio/mailer:latest
+    container_name: mailer
+    restart: unless-stopped
+    volumes:
+      # Config is read-only; state.db is read-write for de-duplication.
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+    # command overrides CMD if you keep state in the mounted ./data dir.
+    command: ["-config", "/app/config.yaml"]
