@@ -25,6 +25,7 @@ type gwPayload struct {
 
 type gwIdentify struct {
 	Token      string            `json:"token"`
+	Intents    int               `json:"intents"`
 	Properties map[string]string `json:"properties"`
 	Presence   gwPresence        `json:"presence"`
 }
@@ -102,7 +103,8 @@ func runGateway(ctx context.Context, token string) error {
 	identBytes, _ := json.Marshal(gwPayload{
 		Op: 2,
 		D: mustJSON(gwIdentify{
-			Token: token,
+			Token:   token,
+			Intents: 0,
 			Properties: map[string]string{
 				"os":      "linux",
 				"browser": "mailer",
