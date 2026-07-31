@@ -15,6 +15,7 @@ import (
 	gomessage "github.com/emersion/go-message"
 	_ "github.com/emersion/go-message/charset"
 	"github.com/emersion/go-message/mail"
+	"golang.org/x/net/html"
 
 	"github.com/recloud/mailer/internal/config"
 )
@@ -256,15 +257,50 @@ func extractPreview(raw []byte) string {
 				continue
 			}
 			ct, _, _ := h.ContentType()
-			if ct == "text/plain" {
+			switch ct {
+			case "text/plain":
 				return truncate(text, maxPreview)
-			}
-			if fallback == "" {
-				fallback = text
+			case "text/html", "text/x-amp-html":
+				if fallback == "" {
+					fallback = htmlToText(text)
+				}
 			}
 		}
 	}
 	return truncate(fallback, maxPreview)
+}
+
+func htmlToText(s string) string {
+	doc, err := html.Parse(strings.NewReader(s))
+	if err != nil {
+		return s
+	}
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		switch n.Type {
+		case html.TextNode:
+			b.WriteString(n.Data)
+		case html.ElementNode:
+			switch n.Data {
+			case "script", "style", "head", "noscript", "template", "iframe", "svg", "object":
+				return
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+				"table", "blockquote", "ul", "ol", "section", "article", "header",
+				"footer", "hr":
+				b.WriteString("\n")
+			}
+		}
+	}
+	walk(doc)
+	return clean(b.String())
 }
 
 func clean(s string) string {
