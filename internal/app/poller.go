@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -38,12 +39,31 @@ func New(cfg *config.Config, store *state.Store) (*Poller, error) {
 	}
 
 	var notifiers []notify.Notifier
+
+	markRead := notify.MarkReadFunc(func(ctx context.Context, account string, uid uint32) error {
+		acc, ok := findAccount(cfg.Accounts, account)
+		if !ok {
+			return fmt.Errorf("unknown account %q", account)
+		}
+		client, err := pool.Acquire(ctx, acc)
+		if err != nil {
+			return err
+		}
+		defer pool.Release(acc.Name, client)
+		return mail.MarkSeen(ctx, client, acc, []uint32{uid})
+	})
+
 	if cfg.Telegram.Enabled {
-		notifiers = append(notifiers, notify.NewTelegram(cfg.Telegram))
+		notifiers = append(notifiers, notify.NewTelegram(cfg.Telegram, cfg.ReadButton, markRead))
 	}
 	if cfg.Discord.Enabled {
-		discord, err := notify.NewDiscord(cfg.Discord, cfg.Accounts)
+		discord, err := notify.NewDiscord(cfg.Discord, cfg.Accounts, cfg.ReadButton, markRead)
 		if err != nil {
+			for _, n := range notifiers {
+				if c, ok := n.(notify.Closer); ok {
+					c.Close()
+				}
+			}
 			pool.Close()
 			return nil, err
 		}
@@ -91,7 +111,21 @@ func (p *Poller) Metrics() *Metrics {
 }
 
 func (p *Poller) Close() {
+	for _, n := range p.notifiers {
+		if c, ok := n.(notify.Closer); ok {
+			c.Close()
+		}
+	}
 	p.pool.Close()
+}
+
+func findAccount(accounts []config.Account, name string) (config.Account, bool) {
+	for _, a := range accounts {
+		if a.Name == name {
+			return a, true
+		}
+	}
+	return config.Account{}, false
 }
 
 func (p *Poller) pollAll(ctx context.Context) {

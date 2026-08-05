@@ -20,6 +20,9 @@ and pushes a notification to **Telegram** and/or **Discord** bots.
 - Handles `UIDVALIDITY` changes (server-side renumbering).
 - Notification **retry with exponential backoff** (configurable attempts & delay).
 - Optional: mark notified mail as `\Seen`.
+- **Optional "mark as read" button** — notifications carry an interactive button
+  that flags the mail as read on the IMAP server on click (Telegram needs
+  `bot_token`; Discord needs `bot_token`, see below).
 - By default only notifies mail that arrives *after* startup (configurable).
 - Notifications include sender, subject, date, and a plain-text body preview
   (MIME/charset decoded).
@@ -142,6 +145,30 @@ accounts:
     # ...imap fields...
     notifiers: [discord]        # only Discord, no Telegram
 ```
+
+## Read button (`read_button`)
+
+Optionally attach an interactive **mark as read** button to each notification.
+Clicking it marks the mail as `\Seen` on the IMAP server directly, without
+opening a mail client.
+
+```yaml
+read_button: true
+```
+
+Requirements:
+
+- **Telegram:** needs `telegram.bot_token`. The app receives button presses via
+  `getUpdates` long polling and confirms with `answerCallbackQuery`.
+- **Discord:** needs `discord.bot_token` — button interactions must be handled by
+  the bot's Gateway connection. In plain **webhook** mode buttons are inert (the
+  app logs a warning at startup). Messages sent via the bot REST API
+  (`channel_id`) always work; if you send via webhook, the webhook must have been
+  created by the bot application so that clicks are dispatched to it.
+
+> Note: this is an on-demand action — the IMAP connection is acquired from the
+> pool at click time to run `STORE +FLAGS \Seen`. It does not affect the existing
+> `mark_seen` (auto-seen after notify) behavior.
 
 ## Connection pool
 

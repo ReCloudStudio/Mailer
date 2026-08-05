@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -36,17 +37,25 @@ type Discord struct {
 	def      discordDest            // global default destination
 	routes   map[string]discordDest // per-account overrides, keyed by account name
 	client   *http.Client
+	readBtn  bool
+	markRead MarkReadFunc
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewDiscord builds a Discord notifier. The accounts slice is used to resolve
 // per-account channel/thread routing. If a bot token is configured, a Gateway
-// connection is started in the background to show the bot as online.
-func NewDiscord(cfg config.Discord, accounts []config.Account) (*Discord, error) {
+// connection is started in the background to show the bot as online and, when
+// readBtn is enabled, to handle message component interactions.
+func NewDiscord(cfg config.Discord, accounts []config.Account, readBtn bool, markRead MarkReadFunc) (*Discord, error) {
 	d := &Discord{
 		botToken: cfg.BotToken,
 		def:      resolveDest(cfg, nil),
 		routes:   make(map[string]discordDest),
 		client:   &http.Client{Timeout: 20 * time.Second},
+		readBtn:  readBtn,
+		markRead: markRead,
 	}
 
 	for _, a := range accounts {
@@ -60,11 +69,27 @@ func NewDiscord(cfg config.Discord, accounts []config.Account) (*Discord, error)
 		d.routes[a.Name] = dest
 	}
 
+	if readBtn && cfg.BotToken == "" {
+		log.Print("[discord] read button requires bot_token to handle interactions; button will be inert")
+	}
+
 	if cfg.BotToken != "" {
-		startGateway(context.Background(), cfg.BotToken)
+		d.ctx, d.cancel = context.WithCancel(context.Background())
+		intents := 0
+		if readBtn {
+			// GUILD_MESSAGES | DIRECT_MESSAGES: deliver message component interactions.
+			intents = 1<<9 | 1<<12
+		}
+		startGateway(d.ctx, cfg.BotToken, intents, d.handleInteraction)
 	}
 
 	return d, nil
+}
+
+func (d *Discord) Close() {
+	if d.cancel != nil {
+		d.cancel()
+	}
 }
 
 // resolveDest computes the delivery target from the global config and an
@@ -118,7 +143,23 @@ func (d *Discord) Send(ctx context.Context, msg mail.Message) error {
 	if !msg.Date.IsZero() {
 		embed["timestamp"] = msg.Date.UTC().Format(time.RFC3339)
 	}
-	body, err := json.Marshal(map[string]any{"embeds": []any{embed}})
+	payload := map[string]any{"embeds": []any{embed}}
+	if d.readBtn {
+		payload["components"] = []any{
+			map[string]any{
+				"type": 1,
+				"components": []any{
+					map[string]any{
+						"type":      2,
+						"style":     1,
+						"label":     "标记已读",
+						"custom_id": readCallbackData(msg.Account, msg.UID),
+					},
+				},
+			},
+		}
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -163,6 +204,74 @@ func (d *Discord) endpoint(dest discordDest) (string, string) {
 		}
 	}
 	return u, ""
+}
+
+type gwInteraction struct {
+	ID            string `json:"id"`
+	Type          int    `json:"type"`
+	Token         string `json:"token"`
+	ApplicationID string `json:"application_id"`
+	Data          struct {
+		CustomID string `json:"custom_id"`
+	} `json:"data"`
+}
+
+func (d *Discord) handleInteraction(ctx context.Context, raw json.RawMessage) {
+	var it gwInteraction
+	if err := json.Unmarshal(raw, &it); err != nil {
+		return
+	}
+	if it.Type != 3 { // MESSAGE_COMPONENT
+		return
+	}
+
+	// Acknowledge deferred within the 3s limit, then do the work async.
+	d.ackInteraction(it.ID, it.Token)
+
+	account, uid, ok := parseReadCallback(it.Data.CustomID)
+	if !ok || d.markRead == nil {
+		return
+	}
+	go func() {
+		mctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		text := "✅ 已标记为已读"
+		if err := d.markRead(mctx, account, uid); err != nil {
+			log.Printf("[discord] mark read %s:%d: %v", account, uid, err)
+			text = "❌ 标记失败，请稍后重试"
+			d.sendFollowup(it.ApplicationID, it.Token, text)
+			return
+		}
+		log.Printf("[discord] marked %s:%d as read", account, uid)
+		d.sendFollowup(it.ApplicationID, it.Token, text)
+	}()
+}
+
+func (d *Discord) ackInteraction(id, token string) {
+	body, _ := json.Marshal(map[string]any{"type": 6}) // DEFERRED_UPDATE_MESSAGE
+	d.postJSON(fmt.Sprintf("https://discord.com/api/v10/interactions/%s/%s/callback", id, token), body)
+}
+
+func (d *Discord) sendFollowup(appID, token, content string) {
+	body, _ := json.Marshal(map[string]any{"content": content})
+	d.postJSON(fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s", appID, token), body)
+}
+
+func (d *Discord) postJSON(url string, body []byte) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bot "+d.botToken)
+	resp, err := d.client.Do(req)
+	if err != nil {
+		log.Printf("[discord] api call %s failed: %v", url, err)
+		return
+	}
+	resp.Body.Close()
 }
 
 func truncateField(s string, max int) string {

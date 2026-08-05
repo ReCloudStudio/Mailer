@@ -30,7 +30,7 @@ type gwIdentify struct {
 	Presence   gwPresence        `json:"presence"`
 }
 
-func startGateway(ctx context.Context, token string) {
+func startGateway(ctx context.Context, token string, intents int, onInteraction func(ctx context.Context, data json.RawMessage)) {
 	go func() {
 		for {
 			select {
@@ -39,7 +39,7 @@ func startGateway(ctx context.Context, token string) {
 			default:
 			}
 
-			if err := runGateway(ctx, token); err != nil {
+			if err := runGateway(ctx, token, intents, onInteraction); err != nil {
 				log.Printf("[discord] gateway: %v (reconnect in 5s)", err)
 			}
 			select {
@@ -51,7 +51,7 @@ func startGateway(ctx context.Context, token string) {
 	}()
 }
 
-func runGateway(ctx context.Context, token string) error {
+func runGateway(ctx context.Context, token string, intents int, onInteraction func(ctx context.Context, data json.RawMessage)) error {
 	c, _, err := websocket.Dial(ctx, "wss://gateway.discord.gg/?v=10&encoding=json", nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -104,7 +104,7 @@ func runGateway(ctx context.Context, token string) error {
 		Op: 2,
 		D: mustJSON(gwIdentify{
 			Token:   token,
-			Intents: 0,
+			Intents: intents,
 			Properties: map[string]string{
 				"os":      "linux",
 				"browser": "mailer",
@@ -138,10 +138,19 @@ func runGateway(ctx context.Context, token string) error {
 		switch p.Op {
 		case 0:
 			var ev struct {
-				Type string `json:"t"`
+				Type string          `json:"t"`
+				Data json.RawMessage `json:"d"`
 			}
-			if json.Unmarshal(msg, &ev) == nil && ev.Type == "READY" {
+			if err := json.Unmarshal(msg, &ev); err != nil {
+				continue
+			}
+			switch ev.Type {
+			case "READY":
 				log.Printf("[discord] gateway: connected and online")
+			case "INTERACTION_CREATE":
+				if onInteraction != nil {
+					onInteraction(ctx, ev.Data)
+				}
 			}
 		case 1:
 			mu.Lock()

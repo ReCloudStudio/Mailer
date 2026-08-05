@@ -285,6 +285,30 @@ func htmlToText(s string) string {
 			switch n.Data {
 			case "script", "style", "head", "noscript", "template", "iframe", "svg", "object":
 				return
+			case "img":
+				src := getAttr(n, "src")
+				alt := getAttr(n, "alt")
+				if src != "" {
+					label := "Image"
+					if alt != "" {
+						label = alt
+					}
+					fmt.Fprintf(&b, "[%s](%s)", label, src)
+				} else if alt != "" {
+					b.WriteString(alt)
+				}
+				return
+			case "a":
+				href := getAttr(n, "href")
+				text := collectText(n)
+				if href != "" && text != "" {
+					fmt.Fprintf(&b, "[%s](%s)", text, href)
+				} else if text != "" {
+					b.WriteString(text)
+				} else {
+					return
+				}
+				return
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -301,6 +325,30 @@ func htmlToText(s string) string {
 	}
 	walk(doc)
 	return clean(b.String())
+}
+
+func getAttr(n *html.Node, name string) string {
+	for _, a := range n.Attr {
+		if a.Key == name {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func collectText(n *html.Node) string {
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			b.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.TrimSpace(b.String())
 }
 
 func clean(s string) string {

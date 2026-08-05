@@ -11,16 +11,17 @@ import (
 
 // Config is the top-level application configuration.
 type Config struct {
-	PollInterval  time.Duration `yaml:"poll_interval"`
-	StateFile     string        `yaml:"state_file"`
-	HealthPort    int           `yaml:"health_port"`
-	RetryAttempts int           `yaml:"retry_attempts"`
-	RetryDelay    time.Duration `yaml:"retry_delay"`
-	NoopInterval  time.Duration `yaml:"noop_interval"`
-	Accounts      []Account     `yaml:"accounts"`
-	Telegram      Telegram      `yaml:"telegram"`
-	Discord       Discord       `yaml:"discord"`
+	PollInterval    time.Duration    `yaml:"poll_interval"`
+	StateFile       string           `yaml:"state_file"`
+	HealthPort      int              `yaml:"health_port"`
+	RetryAttempts   int              `yaml:"retry_attempts"`
+	RetryDelay      time.Duration    `yaml:"retry_delay"`
+	NoopInterval    time.Duration    `yaml:"noop_interval"`
+	Accounts        []Account        `yaml:"accounts"`
+	Telegram        Telegram         `yaml:"telegram"`
+	Discord         Discord          `yaml:"discord"`
 	MessageTemplate *MessageTemplate `yaml:"message_template"`
+	ReadButton      bool             `yaml:"read_button"`
 }
 
 // MessageTemplate defines custom notification text layout.
@@ -31,29 +32,29 @@ type MessageTemplate struct {
 
 // Account describes a single IMAP mailbox to poll.
 type Account struct {
-	Name     string `yaml:"name"`
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	PasswordFile string `yaml:"password_file"`
-	TLS      bool   `yaml:"tls"`
-	Mailbox  string `yaml:"mailbox"`
-	MarkSeen bool   `yaml:"mark_seen"`
-	NotifyExisting bool `yaml:"notify_existing"`
-	SendID bool `yaml:"send_id"`
-	Notifiers []string `yaml:"notifiers"`
-	Discord *AccountDiscord `yaml:"discord"`
+	Name            string           `yaml:"name"`
+	Host            string           `yaml:"host"`
+	Port            int              `yaml:"port"`
+	Username        string           `yaml:"username"`
+	Password        string           `yaml:"password"`
+	PasswordFile    string           `yaml:"password_file"`
+	TLS             bool             `yaml:"tls"`
+	Mailbox         string           `yaml:"mailbox"`
+	MarkSeen        bool             `yaml:"mark_seen"`
+	NotifyExisting  bool             `yaml:"notify_existing"`
+	SendID          bool             `yaml:"send_id"`
+	Notifiers       []string         `yaml:"notifiers"`
+	Discord         *AccountDiscord  `yaml:"discord"`
 	MessageTemplate *MessageTemplate `yaml:"message_template"`
 }
 
 // AccountDiscord routes a single account's notifications to a Discord channel
 // or thread (子区). It overrides the global Discord destination.
 type AccountDiscord struct {
-	Mode       string `yaml:"mode"`
-	ChannelID  string `yaml:"channel_id"`
-	ThreadID   string `yaml:"thread_id"`
-	WebhookURL string `yaml:"webhook_url"`
+	Mode           string `yaml:"mode"`
+	ChannelID      string `yaml:"channel_id"`
+	ThreadID       string `yaml:"thread_id"`
+	WebhookURL     string `yaml:"webhook_url"`
 	WebhookURLFile string `yaml:"webhook_url_file"`
 }
 
@@ -65,22 +66,22 @@ const (
 
 // Telegram holds Telegram Bot API push settings.
 type Telegram struct {
-	Enabled  bool     `yaml:"enabled"`
-	BotToken string   `yaml:"bot_token"`
-	BotTokenFile string `yaml:"bot_token_file"`
-	ChatIDs  []string `yaml:"chat_ids"`
-	APIBase  string   `yaml:"api_base"`
+	Enabled      bool     `yaml:"enabled"`
+	BotToken     string   `yaml:"bot_token"`
+	BotTokenFile string   `yaml:"bot_token_file"`
+	ChatIDs      []string `yaml:"chat_ids"`
+	APIBase      string   `yaml:"api_base"`
 }
 
 // Discord holds Discord push settings. Use either a webhook URL, or a bot
 // token together with a channel ID.
 type Discord struct {
-	Enabled    bool   `yaml:"enabled"`
-	WebhookURL string `yaml:"webhook_url"`
+	Enabled        bool   `yaml:"enabled"`
+	WebhookURL     string `yaml:"webhook_url"`
 	WebhookURLFile string `yaml:"webhook_url_file"`
-	BotToken   string `yaml:"bot_token"`
-	BotTokenFile string `yaml:"bot_token_file"`
-	ChannelID  string `yaml:"channel_id"`
+	BotToken       string `yaml:"bot_token"`
+	BotTokenFile   string `yaml:"bot_token_file"`
+	ChannelID      string `yaml:"channel_id"`
 }
 
 // Load reads, parses and validates the config file at path.

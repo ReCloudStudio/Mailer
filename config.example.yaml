@@ -13,6 +13,12 @@ health_port: 9100
 retry_attempts: 2
 retry_delay: 5s
 
+# Optional interactive "mark as read" button on notifications. Requires a bot:
+# - Telegram: bot token (uses getUpdates long polling)
+# - Discord: bot_token (Gateway handles button interactions; a plain webhook
+#   cannot receive button clicks, the button would be inert)
+read_button: false
+
 # IMAP NOOP keepalive interval. Pooled connections send NOOP at this rate
 # to prevent server-side timeouts.
 noop_interval: 30s

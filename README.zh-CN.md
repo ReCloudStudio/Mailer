@@ -17,6 +17,8 @@
 - 处理 `UIDVALIDITY` 变化（服务端重新编号）。
 - 通知**指数退避重试**（可配置重试次数和延迟）。
 - 可选：将已通知的邮件标记为 `\Seen`（已读）。
+- **可选「标记已读」按钮** — 通知中附带交互按钮，点击即可在 IMAP 服务器上
+  标记邮件为已读（Telegram 需要 bot_token；Discord 需要 bot_token，见下文）。
 - 默认只通知程序启动*之后*到达的邮件（可配置）。
 - 通知内容包含发件人、主题、日期以及纯文本正文预览（已做 MIME/字符集解码）。
 - **可自定义消息模板** — 使用 Go `text/template` 自定义标题和正文格式，支持
@@ -132,6 +134,27 @@ accounts:
     # ...IMAP 相关字段...
     notifiers: [discord]        # 仅 Discord，不含 Telegram
 ```
+
+## 已读按钮（read_button）
+
+可选开启交互式「标记已读」按钮，直接点击通知即可将对应邮件在 IMAP 服务器上
+标记为 `\Seen`，无需登录邮箱客户端。
+
+```yaml
+read_button: true
+```
+
+要求：
+
+- **Telegram：** 需要 `telegram.bot_token`。程序通过 `getUpdates` 长轮询接收
+  按钮点击，并调用 `answerCallbackQuery` 反馈结果。
+- **Discord：** 需要 `discord.bot_token`（按钮交互必须由 Bot 的 Gateway 处理）。
+  纯 **Webhook** 模式无法接收按钮点击，按钮会处于不可用状态——程序会在启动时
+  打印警告。此外，用 Bot 的 REST API（`channel_id`）发送的消息按钮必然可用；
+  若用 Webhook 发送，则该 Webhook 必须由 Bot 应用创建，点击事件才会派发给 Bot。
+
+> 注意：按钮触发的是**即时**标记操作，仅在点击时通过连接池的 IMAP 连接执行
+> `STORE +FLAGS \Seen`，不会影响 `mark_seen`（通知后自动已读）等现有行为。
 
 ## 连接池
 
