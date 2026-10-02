@@ -144,3 +144,104 @@ telegram:
 		t.Fatal("expected error when no accounts configured")
 	}
 }
+
+func TestNewFieldDefaults(t *testing.T) {
+	path := writeTemp(t, `
+accounts:
+  - name: a
+    host: imap.example.com
+    username: u
+    password: p
+telegram:
+  enabled: true
+  bot_token: "t"
+  chat_ids: ["1"]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PreviewLen != 400 {
+		t.Errorf("PreviewLen = %d, want 400", cfg.PreviewLen)
+	}
+	if cfg.SeenRetention != 90*24*time.Hour {
+		t.Errorf("SeenRetention = %v, want 2160h", cfg.SeenRetention)
+	}
+	if cfg.MaxPendingPerAccount != 200 {
+		t.Errorf("MaxPendingPerAccount = %d, want 200", cfg.MaxPendingPerAccount)
+	}
+	if cfg.Accounts[0].PreviewLen != 400 {
+		t.Errorf("account PreviewLen inheritance = %d, want 400", cfg.Accounts[0].PreviewLen)
+	}
+}
+
+func TestPreviewLenExplicitAndInherit(t *testing.T) {
+	path := writeTemp(t, `
+preview_len: 800
+accounts:
+  - name: a
+    host: h
+    username: u
+    password: p
+  - name: b
+    host: h
+    username: u2
+    password: p2
+    preview_len: 120
+telegram:
+  enabled: true
+  bot_token: "t"
+  chat_ids: ["1"]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Accounts[0].PreviewLen != 800 {
+		t.Errorf("account a PreviewLen = %d, want inherit 800", cfg.Accounts[0].PreviewLen)
+	}
+	if cfg.Accounts[1].PreviewLen != 120 {
+		t.Errorf("account b PreviewLen = %d, want explicit 120", cfg.Accounts[1].PreviewLen)
+	}
+}
+
+func TestDuplicateAccountNamesRejected(t *testing.T) {
+	path := writeTemp(t, `
+accounts:
+  - name: dup
+    host: h
+    username: u1
+    password: p
+  - name: dup
+    host: h
+    username: u2
+    password: p
+telegram:
+  enabled: true
+  bot_token: "t"
+  chat_ids: ["1"]
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for duplicate account names")
+	}
+}
+
+func TestDuplicateImplicitNamesRejected(t *testing.T) {
+	// Name falls back to username; two accounts sharing a username collide.
+	path := writeTemp(t, `
+accounts:
+  - host: h1
+    username: same
+    password: p
+  - host: h2
+    username: same
+    password: p
+telegram:
+  enabled: true
+  bot_token: "t"
+  chat_ids: ["1"]
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for implicit duplicate names")
+	}
+}

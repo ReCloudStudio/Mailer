@@ -17,6 +17,12 @@ import (
 	"github.com/recloud/mailer/internal/mail"
 )
 
+const telegramMaxLen = 4096
+
+// maxCallbackData is the Telegram Bot API limit for inline keyboard
+// callback_data (bytes). Accounts with long names could overflow it.
+const maxCallbackData = 64
+
 type Telegram struct {
 	token    string
 	chatIDs  []string
@@ -62,6 +68,9 @@ func (t *Telegram) Name() string { return "telegram" }
 
 func (t *Telegram) Send(ctx context.Context, msg mail.Message) error {
 	text := fmt.Sprintf("*%s*\n%s", escapeMarkdown(msg.Title()), escapeMarkdownPreserveLinks(msg.Text()))
+	// Telegram counts message length after entity escaping; cap the final
+	// payload at the API limit (4096).
+	text = capText(text, telegramMaxLen)
 
 	var firstErr error
 	for _, chatID := range t.chatIDs {
@@ -82,10 +91,14 @@ func (t *Telegram) sendOne(ctx context.Context, chatID, text string, msg mail.Me
 		"disable_web_page_preview": true,
 	}
 	if t.readBtn {
-		payload["reply_markup"] = map[string]any{
-			"inline_keyboard": [][]map[string]string{{
-				{"text": "标记已读", "callback_data": readCallbackData(msg.Account, msg.UID)},
-			}},
+		if cb := readCallbackData(msg.Account, msg.UID); len(cb) <= maxCallbackData {
+			payload["reply_markup"] = map[string]any{
+				"inline_keyboard": [][]map[string]string{{
+					{"text": "标记已读", "callback_data": cb},
+				}},
+			}
+		} else {
+			log.Printf("[telegram] account %q: callback_data too long (%d bytes), read button omitted", msg.Account, len(cb))
 		}
 	}
 	body, err := json.Marshal(payload)

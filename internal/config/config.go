@@ -11,17 +11,20 @@ import (
 
 // Config is the top-level application configuration.
 type Config struct {
-	PollInterval    time.Duration    `yaml:"poll_interval"`
-	StateFile       string           `yaml:"state_file"`
-	HealthPort      int              `yaml:"health_port"`
-	RetryAttempts   int              `yaml:"retry_attempts"`
-	RetryDelay      time.Duration    `yaml:"retry_delay"`
-	NoopInterval    time.Duration    `yaml:"noop_interval"`
-	Accounts        []Account        `yaml:"accounts"`
-	Telegram        Telegram         `yaml:"telegram"`
-	Discord         Discord          `yaml:"discord"`
-	MessageTemplate *MessageTemplate `yaml:"message_template"`
-	ReadButton      bool             `yaml:"read_button"`
+	PollInterval         time.Duration    `yaml:"poll_interval"`
+	StateFile            string           `yaml:"state_file"`
+	HealthPort           int              `yaml:"health_port"`
+	RetryAttempts        int              `yaml:"retry_attempts"`
+	RetryDelay           time.Duration    `yaml:"retry_delay"`
+	NoopInterval         time.Duration    `yaml:"noop_interval"`
+	PreviewLen           int              `yaml:"preview_len"`
+	SeenRetention        time.Duration    `yaml:"seen_retention"`
+	MaxPendingPerAccount int              `yaml:"max_pending_per_account"`
+	Accounts             []Account        `yaml:"accounts"`
+	Telegram             Telegram         `yaml:"telegram"`
+	Discord              Discord          `yaml:"discord"`
+	MessageTemplate      *MessageTemplate `yaml:"message_template"`
+	ReadButton           bool             `yaml:"read_button"`
 }
 
 // MessageTemplate defines custom notification text layout.
@@ -43,6 +46,7 @@ type Account struct {
 	MarkSeen        bool             `yaml:"mark_seen"`
 	NotifyExisting  bool             `yaml:"notify_existing"`
 	SendID          bool             `yaml:"send_id"`
+	PreviewLen      int              `yaml:"preview_len"`
 	Notifiers       []string         `yaml:"notifiers"`
 	Discord         *AccountDiscord  `yaml:"discord"`
 	MessageTemplate *MessageTemplate `yaml:"message_template"`
@@ -125,8 +129,20 @@ func (c *Config) applyDefaults() {
 	if c.NoopInterval <= 0 {
 		c.NoopInterval = 30 * time.Second
 	}
+	if c.PreviewLen <= 0 {
+		c.PreviewLen = 400
+	}
+	if c.SeenRetention <= 0 {
+		c.SeenRetention = 90 * 24 * time.Hour
+	}
+	if c.MaxPendingPerAccount <= 0 {
+		c.MaxPendingPerAccount = 200
+	}
 	for i := range c.Accounts {
 		a := &c.Accounts[i]
+		if a.PreviewLen <= 0 {
+			a.PreviewLen = c.PreviewLen
+		}
 		if a.Mailbox == "" {
 			a.Mailbox = "INBOX"
 		}
@@ -223,6 +239,7 @@ func (c *Config) validate() error {
 	if len(c.Accounts) == 0 {
 		return fmt.Errorf("no accounts configured")
 	}
+	names := make(map[string]int, len(c.Accounts))
 	for i, a := range c.Accounts {
 		if a.Host == "" {
 			return fmt.Errorf("account %d (%s): host is required", i, a.Name)
@@ -230,6 +247,10 @@ func (c *Config) validate() error {
 		if a.Username == "" || a.Password == "" {
 			return fmt.Errorf("account %d (%s): username and password are required", i, a.Name)
 		}
+		if prev, dup := names[a.Name]; dup {
+			return fmt.Errorf("accounts %d and %d share the name %q; names must be unique (used for state, dedup and button callbacks)", prev, i, a.Name)
+		}
+		names[a.Name] = i
 	}
 	if !c.Telegram.Enabled && !c.Discord.Enabled {
 		return fmt.Errorf("no notifier enabled (enable telegram and/or discord)")

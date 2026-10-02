@@ -31,6 +31,19 @@ func readCallbackData(account string, uid uint32) string {
 	return fmt.Sprintf("read:%s:%d", account, uid)
 }
 
+// cap limits s to at most n runes, appending "…" when cut. Platform text
+// limits (Telegram 4096, Discord embed fields) are defined in runes/chars.
+func capText(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n <= 1 {
+		return ""
+	}
+	return strings.TrimSpace(string(r[:n-1])) + "…"
+}
+
 // parseReadCallback decodes a callback id back into account+UID.
 func parseReadCallback(data string) (string, uint32, bool) {
 	const prefix = "read:"

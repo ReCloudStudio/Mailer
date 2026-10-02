@@ -14,17 +14,39 @@ import (
 	"github.com/recloud/mailer/internal/state"
 )
 
-const pollTimeout = 30 * time.Second
+const (
+	pollTimeout = 30 * time.Second
+
+	// pendingAgeLimit is how long an undelivered notification may sit in the
+	// retry queue before it is dropped and counted.
+	pendingAgeLimit = 7 * 24 * time.Hour
+	// pendingInitialDelay is the backoff after the first failure; each
+	// subsequent round doubles it up to pendingMaxDelay.
+	pendingInitialDelay = 30 * time.Second
+	pendingMaxDelay     = time.Hour
+	// seenCleanInterval is how often the seen_messages table is pruned.
+	seenCleanInterval = 24 * time.Hour
+)
+
+// AccountStatus is the non-sensitive health summary for one account.
+type AccountStatus struct {
+	LastPollSuccessUnix  int64   `json:"last_poll_success_unix"`
+	ConsecutiveFailures  int64   `json:"consecutive_failures"`
+	PendingNotifications int     `json:"pending_notifications"`
+	LastPollDurationSec  float64 `json:"last_poll_duration_seconds"`
+}
 
 type Poller struct {
-	cfg       *config.Config
-	store     *state.Store
-	pool      *mail.Pool
-	notifiers []notify.Notifier
-	accNotifs map[string][]string
-	firstRun  map[string]bool
-	mu        sync.Mutex
-	metrics   *Metrics
+	cfg           *config.Config
+	store         *state.Store
+	pool          *mail.Pool
+	notifiers     []notify.Notifier
+	accNotifs     map[string][]string
+	firstRun      map[string]bool
+	mu            sync.Mutex
+	metrics       *Metrics
+	status        map[string]*AccountStatus
+	lastSeenClean time.Time
 }
 
 func New(cfg *config.Config, store *state.Store) (*Poller, error) {
@@ -45,12 +67,12 @@ func New(cfg *config.Config, store *state.Store) (*Poller, error) {
 		if !ok {
 			return fmt.Errorf("unknown account %q", account)
 		}
-		client, err := pool.Acquire(ctx, acc)
+		wc, err := pool.AcquireWork(ctx, acc)
 		if err != nil {
 			return err
 		}
-		defer pool.Release(acc.Name, client)
-		return mail.MarkSeen(ctx, client, acc, []uint32{uid})
+		defer wc.Release()
+		return mail.MarkSeen(ctx, wc.Client(), acc, []uint32{uid})
 	})
 
 	if cfg.Telegram.Enabled {
@@ -71,8 +93,10 @@ func New(cfg *config.Config, store *state.Store) (*Poller, error) {
 	}
 
 	firstRun := make(map[string]bool, len(cfg.Accounts))
+	status := make(map[string]*AccountStatus, len(cfg.Accounts))
 	for _, a := range cfg.Accounts {
 		firstRun[a.Name] = true
+		status[a.Name] = &AccountStatus{}
 	}
 
 	return &Poller{
@@ -83,6 +107,7 @@ func New(cfg *config.Config, store *state.Store) (*Poller, error) {
 		accNotifs: notifMap,
 		firstRun:  firstRun,
 		metrics:   NewMetrics(),
+		status:    status,
 	}, nil
 }
 
@@ -91,6 +116,7 @@ func (p *Poller) Run(ctx context.Context) {
 		len(p.cfg.Accounts), p.cfg.PollInterval, p.notifierNames())
 
 	p.pollAll(ctx)
+	p.cleanSeenIfNeeded()
 
 	ticker := time.NewTicker(p.cfg.PollInterval)
 	defer ticker.Stop()
@@ -102,12 +128,46 @@ func (p *Poller) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			p.pollAll(ctx)
+			p.cleanSeenIfNeeded()
 		}
 	}
 }
 
 func (p *Poller) Metrics() *Metrics {
 	return p.metrics
+}
+
+// Status returns a copy of the per-account health summary for /status.
+func (p *Poller) Status() map[string]AccountStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]AccountStatus, len(p.status))
+	for name, st := range p.status {
+		row := *st
+		if n, err := p.store.PendingCount(name); err == nil {
+			row.PendingNotifications = n
+		}
+		out[name] = row
+	}
+	return out
+}
+
+func (p *Poller) cleanSeenIfNeeded() {
+	p.mu.Lock()
+	due := time.Since(p.lastSeenClean) >= seenCleanInterval
+	if due {
+		p.lastSeenClean = time.Now()
+	}
+	p.mu.Unlock()
+	if !due {
+		return
+	}
+	cutoff := time.Now().Add(-p.cfg.SeenRetention)
+	if err := p.store.CleanSeen(cutoff); err != nil {
+		log.Printf("[state] clean seen: %v", err)
+		return
+	}
+	log.Printf("[state] pruned seen_messages older than %s", p.cfg.SeenRetention)
 }
 
 func (p *Poller) Close() {
@@ -139,31 +199,60 @@ func (p *Poller) pollAll(ctx context.Context) {
 			start := time.Now()
 			if err := p.pollAccount(pollCtx, acc); err != nil {
 				log.Printf("[%s] poll error: %v", acc.Name, err)
+				p.notePollFailure(acc.Name)
+				return
 			}
-			p.metrics.Observe("mailer_poll_duration_seconds",
-				map[string]string{"account": acc.Name},
-				time.Since(start).Seconds(),
-			)
+			p.notePollSuccess(acc.Name, time.Since(start))
 		}(acc)
 	}
 	wg.Wait()
 }
 
+func (p *Poller) notePollSuccess(account string, dur time.Duration) {
+	p.mu.Lock()
+	st := p.status[account]
+	if st != nil {
+		st.LastPollSuccessUnix = time.Now().Unix()
+		st.ConsecutiveFailures = 0
+		st.LastPollDurationSec = dur.Seconds()
+	}
+	p.mu.Unlock()
+	p.metrics.Observe("mailer_last_poll_duration_seconds", map[string]string{"account": account}, dur.Seconds())
+	p.metrics.Observe("mailer_last_poll_success_timestamp", map[string]string{"account": account}, float64(time.Now().Unix()))
+}
+
+func (p *Poller) notePollFailure(account string) {
+	p.mu.Lock()
+	if st := p.status[account]; st != nil {
+		st.ConsecutiveFailures++
+	}
+	p.mu.Unlock()
+	p.metrics.Inc("mailer_poll_failures_total", map[string]string{"account": account})
+}
+
 func (p *Poller) pollAccount(ctx context.Context, acc config.Account) error {
-	prev, _ := p.store.Get(acc.Name)
+	// Step 1: flush any notifications that failed earlier (oldest UID first).
+	p.retryPending(ctx, acc)
+
+	prev, _, err := p.store.Get(acc.Name)
+	if err != nil {
+		// Propagate: treating a DB hiccup as "first run" would reset the
+		// baseline and re-notify the entire mailbox.
+		return err
+	}
 
 	p.mu.Lock()
 	first := p.firstRun[acc.Name]
 	p.firstRun[acc.Name] = false
 	p.mu.Unlock()
 
-	client, err := p.pool.Acquire(ctx, acc)
+	wc, err := p.pool.AcquireWork(ctx, acc)
 	if err != nil {
 		return err
 	}
-	defer p.pool.Release(acc.Name, client)
+	defer wc.Release()
 
-	res, err := mail.Fetch(ctx, client, acc, prev.LastUID, first, prev.UIDValidity)
+	res, err := mail.Fetch(ctx, wc.Client(), acc, prev.LastUID, first, prev.UIDValidity)
 	if err != nil {
 		var changed *mail.UIDValidityChanged
 		if errors.As(err, &changed) {
@@ -193,7 +282,7 @@ func (p *Poller) pollAccount(ctx context.Context, acc config.Account) error {
 	titleTmpl := p.templateFor("title", acc)
 	textTmpl := p.templateFor("text", acc)
 
-	var delivered []uint32
+	var fullyDelivered []uint32
 	for i := range res.Messages {
 		msg := &res.Messages[i]
 		msg.TitleTmpl = titleTmpl
@@ -207,27 +296,153 @@ func (p *Poller) pollAccount(ctx context.Context, acc config.Account) error {
 			continue
 		}
 
-		if p.dispatch(ctx, *msg, notifiers) {
-			delivered = append(delivered, msg.UID)
+		failed := p.dispatch(ctx, *msg, notifiers)
+		if len(failed) == 0 {
+			fullyDelivered = append(fullyDelivered, msg.UID)
 			if err := p.store.MarkDelivered(acc.Name, msg.MessageID); err != nil {
 				log.Printf("[%s] mark delivered: %v", acc.Name, err)
 			}
+			continue
+		}
+		// Undelivered for at least one notifier: queue for retry. LastUID
+		// still advances, but nothing is lost — the queue owns redelivery.
+		if err := p.store.EnqueuePending(state.Pending{
+			Account:   acc.Name,
+			UID:       msg.UID,
+			MessageID: msg.MessageID,
+			From:      msg.From,
+			Subject:   msg.Subject,
+			Date:      msg.Date,
+			Preview:   msg.Preview,
+			Failed:    failed,
+		}, time.Now().Add(pendingInitialDelay)); err != nil {
+			log.Printf("[%s] enqueue pending: %v", acc.Name, err)
 		}
 	}
 
-	if len(delivered) > 0 {
-		newState.LastUID = maxUID(delivered)
-	}
+	// Reflect the new queue depth regardless of outcome.
+	p.observePending(acc.Name)
+
 	if err := p.store.Set(acc.Name, newState); err != nil {
 		return err
 	}
 
-	if acc.MarkSeen && len(delivered) > 0 {
-		if err := mail.MarkSeen(ctx, client, acc, delivered); err != nil {
+	if acc.MarkSeen && len(fullyDelivered) > 0 {
+		if err := mail.MarkSeen(ctx, wc.Client(), acc, fullyDelivered); err != nil {
 			log.Printf("[%s] mark seen: %v", acc.Name, err)
 		}
 	}
 	return nil
+}
+
+// retryPending re-sends due notifications from the queue, oldest UID first.
+func (p *Poller) retryPending(ctx context.Context, acc config.Account) {
+	due, err := p.store.DuePending(acc.Name, time.Now(), p.cfg.MaxPendingPerAccount)
+	if err != nil {
+		log.Printf("[%s] pending queue read: %v", acc.Name, err)
+		return
+	}
+	if len(due) == 0 {
+		return
+	}
+
+	titleTmpl := p.templateFor("title", acc)
+	textTmpl := p.templateFor("text", acc)
+	all := p.notifiersFor(acc)
+	now := time.Now()
+
+	for _, item := range due {
+		if ctx.Err() != nil {
+			return
+		}
+		if now.Sub(item.Created) > pendingAgeLimit {
+			if err := p.store.DeletePending(acc.Name, item.UID); err == nil {
+				p.metrics.Inc("mailer_notify_dropped_total", map[string]string{"account": acc.Name})
+				log.Printf("[%s] uid %d: dropped after %s in retry queue (%d attempt(s))",
+					acc.Name, item.UID, pendingAgeLimit, item.Attempts)
+			}
+			continue
+		}
+
+		// Only retry the notifiers that still owe delivery.
+		targets := filterNotifiers(all, item.Failed)
+		if len(targets) == 0 {
+			// All owed notifiers are gone from config; nothing left to do.
+			_ = p.store.DeletePending(acc.Name, item.UID)
+			continue
+		}
+
+		msg := mail.Message{
+			Account:   item.Account,
+			UID:       item.UID,
+			MessageID: item.MessageID,
+			From:      item.From,
+			Subject:   item.Subject,
+			Date:      item.Date,
+			Preview:   item.Preview,
+			TitleTmpl: titleTmpl,
+			TextTmpl:  textTmpl,
+		}
+		failed := p.dispatch(ctx, msg, targets)
+		if len(failed) == 0 {
+			if err := p.store.DeletePending(acc.Name, item.UID); err != nil {
+				log.Printf("[%s] delete pending %d: %v", acc.Name, item.UID, err)
+			}
+			if err := p.store.MarkDelivered(acc.Name, item.MessageID); err != nil {
+				log.Printf("[%s] mark delivered (retry): %v", acc.Name, err)
+			}
+			log.Printf("[%s] uid %d: retried successfully after %d failed round(s)", acc.Name, item.UID, item.Attempts)
+			if acc.MarkSeen {
+				if wc, err := p.pool.AcquireWork(ctx, acc); err == nil {
+					_ = mail.MarkSeen(ctx, wc.Client(), acc, []uint32{item.UID})
+					wc.Release()
+				}
+			}
+			continue
+		}
+
+		attempts := item.Attempts + 1
+		delay := pendingInitialDelay << min(attempts-1, 20)
+		if delay > pendingMaxDelay {
+			delay = pendingMaxDelay
+		}
+		if err := p.store.UpdatePendingRetry(acc.Name, item.UID, failed, attempts, now.Add(delay)); err != nil {
+			log.Printf("[%s] update pending %d: %v", acc.Name, item.UID, err)
+		}
+	}
+	p.observePending(acc.Name)
+}
+
+func (p *Poller) observePending(account string) {
+	n, err := p.store.PendingCount(account)
+	if err != nil {
+		return
+	}
+	p.metrics.Observe("mailer_pending_notifications", map[string]string{"account": account}, float64(n))
+}
+
+func filterNotifiers(all []notify.Notifier, names []string) []notify.Notifier {
+	if len(names) == 0 {
+		return all
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var out []notify.Notifier
+	for _, n := range all {
+		if want[n.Name()] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (p *Poller) notifiersFor(acc config.Account) []notify.Notifier {
@@ -266,25 +481,19 @@ func (p *Poller) templateFor(field string, acc config.Account) string {
 	return ""
 }
 
-func maxUID(uids []uint32) uint32 {
-	var max uint32
-	for _, u := range uids {
-		if u > max {
-			max = u
-		}
-	}
-	return max
-}
-
-func (p *Poller) dispatch(ctx context.Context, msg mail.Message, notifiers []notify.Notifier) bool {
-	ok := false
+// dispatch sends msg to every notifier, retrying inline per config. It
+// returns the names of notifiers that still failed after inline retries
+// (empty slice == full success).
+func (p *Poller) dispatch(ctx context.Context, msg mail.Message, notifiers []notify.Notifier) []string {
+	var failed []string
 	for _, n := range notifiers {
+		ok := false
 		for attempt := 0; attempt <= p.cfg.RetryAttempts; attempt++ {
 			if attempt > 0 {
 				delay := p.cfg.RetryDelay * (1 << (attempt - 1))
 				select {
 				case <-ctx.Done():
-					return ok
+					break
 				case <-time.After(delay):
 				}
 			}
@@ -304,8 +513,11 @@ func (p *Poller) dispatch(ctx context.Context, msg mail.Message, notifiers []not
 			ok = true
 			break
 		}
+		if !ok {
+			failed = append(failed, n.Name())
+		}
 	}
-	return ok
+	return failed
 }
 
 func (p *Poller) notifierNames() []string {

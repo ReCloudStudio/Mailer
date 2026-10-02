@@ -2,6 +2,7 @@ package mail
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"mime"
@@ -22,7 +23,7 @@ import (
 
 const maxBodyBytes = 256 * 1024
 
-const maxPreview = 400
+const defaultPreviewLen = 400
 
 type FetchResult struct {
 	Messages    []Message
@@ -38,6 +39,10 @@ func dialOptions(ctx context.Context) *imapclient.Options {
 	opts := &imapclient.Options{
 		WordDecoder: &mime.WordDecoder{CharsetReader: gomessage.CharsetReader},
 		Dialer:      dialer,
+	}
+	// Escape hatch for self-signed test servers; never set in production.
+	if os.Getenv("MAILER_TLS_SKIP_VERIFY") != "" {
+		opts.TLSConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	if os.Getenv("MAILER_DEBUG_IMAP") != "" {
 		opts.DebugWriter = os.Stderr
@@ -99,6 +104,12 @@ func dial(ctx context.Context, acc config.Account) (*imapclient.Client, error) {
 	return client, nil
 }
 
+// Dial opens a logged-in connection for ad-hoc use (health checks, tests).
+// Callers own the connection and must Close it.
+func Dial(ctx context.Context, acc config.Account) (*imapclient.Client, error) {
+	return dial(ctx, acc)
+}
+
 func Fetch(ctx context.Context, client *imapclient.Client, acc config.Account, sinceUID uint32, firstRun bool, prevUIDValidity uint32) (*FetchResult, error) {
 	selectData, err := client.Select(acc.Mailbox, nil).Wait()
 	if err != nil {
@@ -157,7 +168,7 @@ func Fetch(ctx context.Context, client *imapclient.Client, acc config.Account, s
 		if uid > result.HighestUID {
 			result.HighestUID = uid
 		}
-		result.Messages = append(result.Messages, buildMessage(acc.Name, buf))
+		result.Messages = append(result.Messages, buildMessage(acc.Name, acc.PreviewLen, buf))
 	}
 
 	return result, nil
@@ -187,7 +198,7 @@ func MarkSeen(ctx context.Context, client *imapclient.Client, acc config.Account
 	return nil
 }
 
-func buildMessage(accountName string, buf *imapclient.FetchMessageBuffer) Message {
+func buildMessage(accountName string, previewLen int, buf *imapclient.FetchMessageBuffer) Message {
 	m := Message{
 		Account: accountName,
 		UID:     uint32(buf.UID),
@@ -207,7 +218,7 @@ func buildMessage(accountName string, buf *imapclient.FetchMessageBuffer) Messag
 		if len(bs.Bytes) == 0 {
 			continue
 		}
-		if preview := extractPreview(bs.Bytes); preview != "" {
+		if preview := extractPreview(bs.Bytes, previewLen); preview != "" {
 			m.Preview = preview
 			break
 		}
@@ -233,7 +244,10 @@ func formatAddresses(addrs []imap.Address) string {
 	return strings.Join(parts, ", ")
 }
 
-func extractPreview(raw []byte) string {
+func extractPreview(raw []byte, maxChars int) string {
+	if maxChars <= 0 {
+		maxChars = defaultPreviewLen
+	}
 	mr, err := mail.CreateReader(strings.NewReader(string(raw)))
 	if err != nil {
 		return ""
@@ -259,7 +273,7 @@ func extractPreview(raw []byte) string {
 			ct, _, _ := h.ContentType()
 			switch ct {
 			case "text/plain":
-				return truncate(text, maxPreview)
+				return capRunes(text, maxChars)
 			case "text/html", "text/x-amp-html":
 				if fallback == "" {
 					fallback = htmlToText(text)
@@ -267,7 +281,17 @@ func extractPreview(raw []byte) string {
 			}
 		}
 	}
-	return truncate(fallback, maxPreview)
+	return capRunes(fallback, maxChars)
+}
+
+// capRunes truncates s to at most max runes, appending an ellipsis when cut,
+// and trims trailing whitespace introduced by the cut.
+func capRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return strings.TrimSpace(string(r[:max])) + "…"
 }
 
 func htmlToText(s string) string {
@@ -286,6 +310,10 @@ func htmlToText(s string) string {
 			case "script", "style", "head", "noscript", "template", "iframe", "svg", "object":
 				return
 			case "img":
+				if isSpacerImg(n) {
+					// 1x1 tracking beacons / layout spacers add no content.
+					return
+				}
 				src := getAttr(n, "src")
 				alt := getAttr(n, "alt")
 				if src != "" {
@@ -336,6 +364,29 @@ func getAttr(n *html.Node, name string) string {
 	return ""
 }
 
+// isSpacerImg reports whether an <img> is a tracking pixel or layout spacer
+// (width/height attribute ≤ 2px), which should never appear in a preview.
+func isSpacerImg(n *html.Node) bool {
+	dim := func(key string) (int, bool) {
+		v := getAttr(n, key)
+		if v == "" {
+			return 0, false
+		}
+		if strings.HasSuffix(v, "px") {
+			v = strings.TrimSuffix(v, "px")
+		}
+		var px int
+		_, err := fmt.Sscanf(v, "%d", &px)
+		return px, err == nil
+	}
+	w, wok := dim("width")
+	h, hoc := dim("height")
+	if !wok && !hoc {
+		// No dimensions: treat data-URI images (typical beacons) as spacers.
+		return strings.HasPrefix(getAttr(n, "src"), "data:")
+	}
+	return (wok && w <= 2) || (hoc && h <= 2)
+}
 func collectText(n *html.Node) string {
 	var b strings.Builder
 	var walk func(*html.Node)
@@ -353,18 +404,31 @@ func collectText(n *html.Node) string {
 
 func clean(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.NewReplacer(
+		"\u00a0", " ", // &nbsp;
+		"\u200b", "", // zero-width space
+		"\ufeff", "", // BOM / zero-width no-break space
+		"\u2007", "", // figure space (layout spacer)
+		"\u3000", " ", // ideographic space
+	).Replace(s)
 	lines := strings.Split(s, "\n")
 	out := make([]string, 0, len(lines))
+	blank := false
 	for _, l := range lines {
-		out = append(out, strings.TrimRight(l, " \t"))
+		l = strings.TrimRight(l, " \t")
+		if l == "" {
+			// Collapse runs of blank lines (HTML layouts emit one \n per
+			// block tag) into a single newline.
+			if !blank && len(out) > 0 {
+				blank = true
+			}
+			continue
+		}
+		if blank {
+			out = append(out, "")
+			blank = false
+		}
+		out = append(out, l)
 	}
 	return strings.TrimSpace(strings.Join(out, "\n"))
-}
-
-func truncate(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return strings.TrimSpace(string(r[:max])) + "…"
 }

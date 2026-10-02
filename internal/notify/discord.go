@@ -145,18 +145,22 @@ func (d *Discord) Send(ctx context.Context, msg mail.Message) error {
 	}
 	payload := map[string]any{"embeds": []any{embed}}
 	if d.readBtn {
-		payload["components"] = []any{
-			map[string]any{
-				"type": 1,
-				"components": []any{
-					map[string]any{
-						"type":      2,
-						"style":     1,
-						"label":     "标记已读",
-						"custom_id": readCallbackData(msg.Account, msg.UID),
+		if cb := readCallbackData(msg.Account, msg.UID); len(cb) <= 100 { // Discord custom_id limit
+			payload["components"] = []any{
+				map[string]any{
+					"type": 1,
+					"components": []any{
+						map[string]any{
+							"type":      2,
+							"style":     1,
+							"label":     "标记已读",
+							"custom_id": cb,
+						},
 					},
 				},
-			},
+			}
+		} else {
+			log.Printf("[discord] account %q: custom_id too long (%d bytes), read button omitted", msg.Account, len(cb))
 		}
 	}
 	body, err := json.Marshal(payload)

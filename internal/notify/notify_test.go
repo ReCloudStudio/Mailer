@@ -31,3 +31,31 @@ func TestParseReadCallbackInvalid(t *testing.T) {
 		}
 	}
 }
+
+func TestCapText(t *testing.T) {
+	tests := []struct {
+		name string
+		s    string
+		n    int
+		want string
+	}{
+		{"fits untouched", "hello", 4096, "hello"},
+		{"exact fit", "hello", 5, "hello"},
+		{"cuts one over", "hello", 4, "hel…"},
+		{"n=1 empty", "hello", 1, ""},
+		{"n=0 empty", "hello", 0, ""},
+		{"multibyte", "你好世界你好", 4, "你好世…"},
+		{"trims trailing space before ellipsis", "hello world", 6, "hello…"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := capText(tc.s, tc.n)
+			if got != tc.want {
+				t.Errorf("capText(%q, %d) = %q, want %q", tc.s, tc.n, got, tc.want)
+			}
+			if r := []rune(got); tc.n > 1 && len(r) > tc.n {
+				t.Errorf("capText(%q, %d) length %d exceeds limit", tc.s, tc.n, len(r))
+			}
+		})
+	}
+}

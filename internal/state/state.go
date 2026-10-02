@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -15,6 +15,22 @@ import (
 type AccountState struct {
 	LastUID     uint32
 	UIDValidity uint32
+}
+
+// Pending is a notification whose delivery failed (fully or for some
+// notifiers) and which awaits retry with exponential backoff.
+type Pending struct {
+	Account   string
+	UID       uint32
+	MessageID string
+	From      string
+	Subject   string
+	Date      time.Time
+	Preview   string
+	Failed    []string // notifier names still undelivered
+	Attempts  int
+	NextTry   time.Time
+	Created   time.Time
 }
 
 type Store struct {
@@ -34,6 +50,21 @@ CREATE TABLE IF NOT EXISTS seen_messages (
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     PRIMARY KEY (message_id, account)
 );
+CREATE INDEX IF NOT EXISTS idx_seen_created ON seen_messages(created_at);
+CREATE TABLE IF NOT EXISTS pending_notifications (
+    account      TEXT    NOT NULL,
+    uid          INTEGER NOT NULL,
+    message_id   TEXT    NOT NULL DEFAULT '',
+    sender       TEXT    NOT NULL DEFAULT '',
+    subject      TEXT    NOT NULL DEFAULT '',
+    date_unix    INTEGER NOT NULL DEFAULT 0,
+    preview      TEXT    NOT NULL DEFAULT '',
+    failed       TEXT    NOT NULL DEFAULT '',
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    next_try_unix INTEGER NOT NULL DEFAULT 0,
+    created_unix INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account, uid)
+);
 `
 
 func Load(path string) (*Store, error) {
@@ -50,12 +81,9 @@ func Load(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 
-	// Ensure both tables exist. WAL mode may persist schema across runs.
-	for _, stmt := range []string{schema} {
-		if _, err := db.Exec(stmt); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("init schema: %w", err)
-		}
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init schema: %w", err)
 	}
 
 	return &Store{db: db}, nil
@@ -68,19 +96,22 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) Get(account string) (AccountState, bool) {
+// Get returns the stored state for an account. found is false on first run
+// (no row). A database error is propagated so callers must not mistake a
+// transient failure for a fresh baseline (which would re-notify everything).
+func (s *Store) Get(account string) (AccountState, bool, error) {
 	var st AccountState
 	row := s.db.QueryRow(
 		`SELECT last_uid, uid_validity FROM account_state WHERE account = ?`,
 		account,
 	)
 	if err := row.Scan(&st.LastUID, &st.UIDValidity); err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			log.Printf("[state] get %q: %v", account, err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return AccountState{}, false, nil
 		}
-		return AccountState{}, false
+		return AccountState{}, false, fmt.Errorf("get state %q: %w", account, err)
 	}
-	return st, true
+	return st, true, nil
 }
 
 func (s *Store) Set(account string, st AccountState) error {
@@ -134,4 +165,157 @@ func (s *Store) CleanSeen(before time.Time) error {
 		return fmt.Errorf("clean seen: %w", err)
 	}
 	return nil
+}
+
+// EnqueuePending inserts or updates a failed-delivery row. When the row
+// already exists its failed-notifier set is merged (union) and its original
+// created time preserved, so the give-up age counts from the first failure.
+// A zero p.Created means "now"; callers may seed an explicit creation time.
+func (s *Store) EnqueuePending(p Pending, nextTry time.Time) error {
+	existing, found, err := s.getPending(p.Account, p.UID)
+	if err != nil {
+		return err
+	}
+	failed := p.Failed
+	attempts := p.Attempts
+	created := p.Created
+	if created.IsZero() {
+		created = time.Now()
+	}
+	if found {
+		failed = union(existing.Failed, p.Failed)
+		attempts = existing.Attempts
+		created = existing.Created
+	}
+	_, err = s.db.Exec(`
+INSERT INTO pending_notifications
+    (account, uid, message_id, sender, subject, date_unix, preview, failed, attempts, next_try_unix, created_unix)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account, uid) DO UPDATE SET
+    message_id = excluded.message_id,
+    sender     = excluded.sender,
+    subject    = excluded.subject,
+    date_unix  = excluded.date_unix,
+    preview    = excluded.preview,
+    failed     = excluded.failed,
+    next_try_unix = excluded.next_try_unix`,
+		p.Account, p.UID, p.MessageID, p.From, p.Subject,
+		p.Date.Unix(), p.Preview, strings.Join(failed, ","),
+		attempts, nextTry.Unix(), created.Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("enqueue pending: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) getPending(account string, uid uint32) (Pending, bool, error) {
+	var p Pending
+	var dateUnix, nextTry, created int64
+	var failed string
+	err := s.db.QueryRow(`
+SELECT account, uid, message_id, sender, subject, date_unix, preview, failed, attempts, next_try_unix, created_unix
+FROM pending_notifications WHERE account = ? AND uid = ?`,
+		account, uid,
+	).Scan(&p.Account, &p.UID, &p.MessageID, &p.From, &p.Subject,
+		&dateUnix, &p.Preview, &failed, &p.Attempts, &nextTry, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Pending{}, false, nil
+	}
+	if err != nil {
+		return Pending{}, false, fmt.Errorf("get pending: %w", err)
+	}
+	p.Date = time.Unix(dateUnix, 0)
+	p.NextTry = time.Unix(nextTry, 0)
+	p.Created = time.Unix(created, 0)
+	p.Failed = splitCSV(failed)
+	return p, true, nil
+}
+
+// DuePending returns rows for the account whose backoff has elapsed, ordered
+// by UID. Rows whose next_try is in the future are skipped entirely (not just
+// the loop), so a poll cycle cannot stall behind an unreachable notifier.
+func (s *Store) DuePending(account string, now time.Time, limit int) ([]Pending, error) {
+	rows, err := s.db.Query(`
+SELECT account, uid, message_id, sender, subject, date_unix, preview, failed, attempts, next_try_unix, created_unix
+FROM pending_notifications
+WHERE account = ? AND next_try_unix <= ?
+ORDER BY uid LIMIT ?`,
+		account, now.Unix(), limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("due pending: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Pending
+	for rows.Next() {
+		var p Pending
+		var dateUnix, nextTry, created int64
+		var failed string
+		if err := rows.Scan(&p.Account, &p.UID, &p.MessageID, &p.From, &p.Subject,
+			&dateUnix, &p.Preview, &failed, &p.Attempts, &nextTry, &created); err != nil {
+			return nil, fmt.Errorf("scan pending: %w", err)
+		}
+		p.Date = time.Unix(dateUnix, 0)
+		p.NextTry = time.Unix(nextTry, 0)
+		p.Created = time.Unix(created, 0)
+		p.Failed = splitCSV(failed)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// UpdatePendingRetry records a failed retry round: bumps attempts, stores the
+// still-failing notifier set and the next attempt time.
+func (s *Store) UpdatePendingRetry(account string, uid uint32, failed []string, attempts int, nextTry time.Time) error {
+	_, err := s.db.Exec(`
+UPDATE pending_notifications
+SET failed = ?, attempts = ?, next_try_unix = ?
+WHERE account = ? AND uid = ?`,
+		strings.Join(failed, ","), attempts, nextTry.Unix(), account, uid,
+	)
+	if err != nil {
+		return fmt.Errorf("update pending retry: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) DeletePending(account string, uid uint32) error {
+	_, err := s.db.Exec(`DELETE FROM pending_notifications WHERE account = ? AND uid = ?`, account, uid)
+	if err != nil {
+		return fmt.Errorf("delete pending: %w", err)
+	}
+	return nil
+}
+
+// PendingCount counts queued undelivered notifications for an account.
+func (s *Store) PendingCount(account string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM pending_notifications WHERE account = ?`, account).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count pending: %w", err)
+	}
+	return n, nil
+}
+
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
+func union(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	var out []string
+	for _, list := range [][]string{a, b} {
+		for _, v := range list {
+			if v != "" && !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }

@@ -9,23 +9,35 @@ and pushes a notification to **Telegram** and/or **Discord** bots.
 
 - Polls multiple IMAP accounts concurrently on a configurable interval.
 - Implicit TLS (port 993) or STARTTLS (port 143).
-- **IMAP connection pool** with NOOP keepalive — one persistent connection per
-  account instead of reconnecting every poll cycle.
+- **IMAP connection pool** with NOOP keepalive — per account the pool keeps two
+  connections (a watch connection for liveness checks and a work connection
+  borrowed exclusively for fetch/store), instead of reconnecting every poll.
 - De-duplicates by tracking the last processed UID per account in a **SQLite**
   database, so mail is never notified twice — without altering your mailbox by
-  default.
+  default. The Message-ID dedup table prunes itself (`seen_retention`,
+  default 90 days).
 - **Message-ID de-duplication** — the database also remembers which
   `Message-ID` values have been notified, catching duplicates across mailbox
   moves or UID changes.
 - Handles `UIDVALIDITY` changes (server-side renumbering).
-- Notification **retry with exponential backoff** (configurable attempts & delay).
+- Notification **retry with exponential backoff** (configurable attempts & delay),
+  plus a **persistent pending queue**: notifications that still fail after the
+  inline retries are stored in SQLite and re-attempted on later poll cycles
+  (backoff 30 s → 1 h, dropped after 7 days with a counter). A temporary
+  network/API outage never costs you a notification.
 - Optional: mark notified mail as `\Seen`.
 - **Optional "mark as read" button** — notifications carry an interactive button
   that flags the mail as read on the IMAP server on click (Telegram needs
   `bot_token`; Discord needs `bot_token`, see below).
 - By default only notifies mail that arrives *after* startup (configurable).
 - Notifications include sender, subject, date, and a plain-text body preview
-  (MIME/charset decoded).
+  (MIME/charset decoded). The preview is **cleaned**: template/blank-line runs
+  collapsed, non-breaking/zero-width spaces removed, 1×1 tracking pixels
+  skipped — no more notification walls of empty lines. Length is configurable
+  via `preview_len` (global and per-account, default 400 characters).
+- **Platform-safe delivery** — text is truncated to the Telegram (4096) and
+  Discord (embed limits) caps *after* escaping, so long mail never fails to
+  deliver with an opaque API error.
 - **Customizable message templates** — use Go `text/template` to format title
   and body globally or per-account.
 - Telegram (Bot API, **MarkdownV2** mode) and Discord (webhook or bot token)
@@ -36,8 +48,11 @@ and pushes a notification to **Telegram** and/or **Discord** bots.
 - **Secrets via file path or environment variables** — `password_file`,
   `bot_token_file`, `webhook_url_file`; all secret fields support
   `${VAR}` / `$VAR` expansion.
-- **Health check (`/health`) + Prometheus metrics (`/metrics`)** on a
-  configurable HTTP port.
+- **Health check (`/health`), account status (`/status`) + Prometheus metrics
+  (`/metrics`)** on a configurable HTTP port.
+- **`mailer test` subcommand** — verifies IMAP login, mailbox `SELECT`,
+  capabilities (incl. an IDLE probe) and a test notification per channel,
+  without starting the daemon.
 - CGO-free build → tiny multi-arch (amd64/arm64) Docker image.
 - Graceful shutdown on SIGINT/SIGTERM.
 
@@ -45,7 +60,8 @@ and pushes a notification to **Telegram** and/or **Discord** bots.
 
 The `accounts:` list supports any number of mailboxes — just add more entries.
 They are polled **concurrently** and each keeps its own de-duplication state
-(keyed by `name`, so give every account a unique `name`):
+(keyed by `name`, so give every account a unique `name` — duplicates are
+rejected at startup):
 
 ```yaml
 accounts:
@@ -172,21 +188,72 @@ Requirements:
 
 ## Connection pool
 
-Each account holds one persistent IMAP connection. After every poll the
-connection is returned to the pool and kept alive with NOOP commands on a
-configurable `noop_interval` (default: 60 s). If a NOOP times out (10 s), the
-connection is closed and a new one is created on the next poll.
+Each account holds **two** persistent IMAP connections:
+
+- a **watch** connection, used only for background liveness checks (NOOP);
+- a **work** connection, borrowed exclusively (`AcquireWork` → use → `Release`)
+  by whichever operation needs to talk to the server right now — a poll cycle
+  or a "mark as read" button click.
+
+Because poll and read-button traffic no longer share the same socket, a slow
+fetch can no longer interleave with a `STORE` from another goroutine. If the
+work connection happens to be idle, it is promoted to answer the NOOP, so a
+live connection is never pinged needlessly; if the watch connection dies, the
+next `Watch`/`AcquireWork` redials lazily.
+
+Connections are kept alive with NOOP commands on a configurable
+`noop_interval` (default 30 s). A NOOP that times out (10 s) closes the
+connection, which is then redialed on demand.
 
 ## Notification retry
 
-Failed notifications are retried with exponential backoff:
+Retries happen at **two levels**.
+
+**1. Inline, per notifier (same poll cycle).** Each failing notifier is retried
+up to `retry_attempts` times with an exponential delay:
 
 ```yaml
-retry_attempts: 3    # max retries per message (default: 2)
+retry_attempts: 2    # extra tries beyond the first (default: 2)
 retry_delay: 5s      # base delay, doubled each attempt (default: 5 s)
 ```
 
-If all retries are exhausted the message is skipped and logged.
+**2. Persistent pending queue (across restarts).** If a message still has
+failing notifiers after the inline retries, it is **not** dropped: it is
+recorded in the `pending_notifications` table and re-attempted from now on
+*only against the notifiers that failed* — notifiers that already delivered
+are never sent the same mail twice. On every poll cycle the queue is drained
+first, before new mail:
+
+```yaml
+max_pending_per_account: 200   # due queue items retried per account per poll cycle (default: 200)
+```
+
+- Backoff per message: 30 s → 60 s → 120 s → … capped at **1 hour**.
+- Delivery order follows the message UID, so old mail is not overtaken.
+- After **7 days** a still-undeliverable notification is dropped and counted in
+  `mailer_notify_dropped_total`.
+- Pending rows survive a restart; `mailer_pending_notifications` reports the
+  current queue depth and `/status` shows it per account.
+
+This closes the old failure mode where a Telegram API outage during a poll
+would advance the UID cursor and lose the notification forever.
+
+## Preview text
+
+The body preview is cleaned up before it is sent, so templated "verification
+code" emails (long runs of blank lines, spacer images, invisible whitespace)
+do not blow up the notification:
+
+- runs of blank lines collapse to a single blank line;
+- non-breaking (`U+00A0`) and ideographic (`U+3000`) spaces become ordinary
+  spaces; zero-width characters (`U+200B`, `U+FEFF`, `U+2007`) are removed;
+- 1×1/2×2 spacer and `data:`-URI tracking-pixel images are skipped;
+- the result is truncated to `preview_len` **characters** (runes, so CJK is
+  not cut mid-glyph), default 400, configurable globally and per account.
+
+On top of that, each notifier enforces its own platform limit *after*
+formatting/escaping (Telegram 4096 characters; Discord 4000 for the embed
+description, 256 for the title).
 
 ## Message de-duplication (Message-ID)
 
@@ -194,6 +261,13 @@ In addition to UID-based tracking, the `seen_messages` table records every
 successfully delivered `Message-ID`. This catches duplicates that occur when a
 message moves between folders (new UID) or the server renumbers (UID validity
 change). No extra configuration is needed.
+
+Rows older than `seen_retention` (default **2160 h = 90 days**) are pruned once
+a day, so the table cannot grow without bound on a long-running install:
+
+```yaml
+seen_retention: 2160h
+```
 
 ## Customizable message templates
 
@@ -216,16 +290,73 @@ The global template applies to every account; an account-level
 Available fields: `{{.From}}`, `{{.Subject}}`, `{{.Date}}`, `{{.Preview}}`,
 `{{.MessageID}}`, `{{.Text}}` (full body), `{{.Account}}` (config account name).
 
-## Health check & Prometheus metrics
+## Health check, status & Prometheus metrics
 
-A built-in HTTP server (default port **9100**) exposes two endpoints:
+A built-in HTTP server (default port **9100**) exposes three endpoints:
 
 | Endpoint    | Description                           |
 |-------------|---------------------------------------|
-| `GET /health` | Returns `{"status":"ok"}` — ideal for container health checks. |
-| `GET /metrics` | Prometheus text format — poll counts, notification counts, errors. |
+| `GET /health` | Pure liveness probe: returns `{"status":"ok"}` as soon as the HTTP server is up — ideal for container health checks. It deliberately does **not** reflect IMAP/API failures, so one flaky notifier never gets you restarted into an outage. |
+| `GET /status` | Per-account operational state as JSON: last successful poll (Unix time), consecutive poll failures, and pending (unsent) notifications. |
+| `GET /metrics` | Prometheus text format — poll counts, notification counts, errors, queue depth. |
+
+```console
+$ curl -s localhost:9100/status
+{"status":"ok","accounts":{"primary":{"last_poll_success_unix":1755561600,"consecutive_failures":0,"pending_notifications":2,"last_poll_duration_sec":0.41}}}
+```
+
+`/status` is intentionally limited to non-sensitive numbers: it exposes **no**
+hostnames, usernames, message content, or raw error strings, so it can be
+scraped or exposed behind a reverse proxy without leaking credentials.
 
 Configure the port with `health_port` (set to `0` to disable the server).
+
+Useful metrics:
+
+| Metric | Meaning |
+|--------|---------|
+| `mailer_poll_failures_total{account}` | Poll cycles that ended with an error. |
+| `mailer_last_poll_success_timestamp{account}` | Unix time of the last successful poll — alert when it goes stale. |
+| `mailer_last_poll_duration_seconds{account}` | Duration of the most recent poll (gauge with last-value semantics). |
+| `mailer_pending_notifications{account}` | Notifications queued for redelivery right now. |
+| `mailer_notify_dropped_total{account}` | Notifications abandoned after 7 days. |
+| `mailer_messages_fetched_total` / `mailer_messages_delivered_total` | Mail read from IMAP / delivered to a notifier. |
+
+## `mailer test` — connection & notification check
+
+`test` runs the same IMAP handshake the daemon uses, then tries a real
+notification through every enabled notifier, and exits `1` if anything
+failed:
+
+```bash
+./mailer -config config.yaml test
+```
+
+```console
+$ ./mailer -config config.yaml test
+IMAP primary (imap.example.com:993 tls=true mailbox=INBOX)
+  ✓ select INBOX: 142 message(s), UIDNEXT 317, UIDVALIDITY 1
+  ✓ capabilities: AUTH=PLAIN IDLE IMAP4rev2 LOG-IN-STARTTLS NAMESPACE
+  ✓ IDLE available (real-time mode lands in v1.2)
+IMAP work (imap.example.org:993 tls=true mailbox=INBOX)
+  ✗ select INBOX: LOGIN failed: [AUTHENTICATIONFAILED] Invalid credentials
+notifier telegram: ✓ test message sent
+notifier discord: ✓ test message sent
+
+1 check(s) failed
+```
+
+For each account it reports:
+
+- **select** — credentials valid (login happens as part of dialing) and the
+  configured mailbox exists, with its message count, `UIDNEXT` and
+  `UIDVALIDITY`;
+- **capabilities / IDLE probe** — server capabilities, and whether `IDLE` (or
+  `IMAP4rev2`, which requires it) is available;
+- **per-notifier test send** — one real message through every enabled
+  notifier, so you see immediately whether the token/chat target works.
+
+Note that this *does* send test messages to your chats/channels.
 
 ## Secrets management
 
@@ -342,13 +473,21 @@ Two layers prevent duplicate notifications:
 
 ```
 main.go                       entrypoint, flag parsing, signal handling,
-                              health & metrics HTTP server
+                              health/status & metrics HTTP server
+subcmd.go                     `mailer test` subcommand
 internal/config               YAML config loading, defaults, validation
-internal/mail                 IMAP fetch, MIME preview extraction, mark-seen
-internal/mail/pool.go         IMAP connection pool with NOOP keepalive
-internal/notify               Telegram (+MarkdownV2) + Discord notifiers
-internal/state                SQLite-backed UID progress + Message-ID dedup
-internal/app                  scheduler tying fetch + notify + state together
+internal/mail                 IMAP fetch, MIME preview extraction + cleanup,
+                              mark-seen
+internal/mail/pool.go         dual (watch/work) IMAP connection pool with
+                              NOOP keepalive
+internal/notify               Telegram (+MarkdownV2) + Discord notifiers,
+                              platform-limit truncation
+internal/state                SQLite: UID progress, Message-ID dedup,
+                              pending-notification queue
+internal/app                  scheduler tying fetch + notify + retry queue +
+                              status together
 internal/app/metrics.go       Prometheus metric counters
-.github/workflows             CI to build & push the Docker image to GHCR
+.github/workflows             CI: build & push the Docker image to GHCR;
+                              vet + race-enabled tests
 ```
+

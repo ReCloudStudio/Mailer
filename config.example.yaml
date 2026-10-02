@@ -23,6 +23,20 @@ read_button: false
 # to prevent server-side timeouts.
 noop_interval: 30s
 
+# Max characters of preview text extracted from each mail body. Any notifier
+# further truncates to its own platform limit (e.g. Telegram 4096 chars).
+# Can be overridden per account. Default 400.
+preview_len: 400
+
+# How long delivered Message-IDs are remembered for dedup, before the
+# seen_messages table is pruned (checked about once a day). Default 90d.
+seen_retention: 2160h
+
+# Upper bound on how many failed notifications are retried per account each
+# poll cycle. Failed notices retry with exponential backoff (capped at 1h)
+# and are dropped after 7 days. Default 200.
+max_pending_per_account: 200
+
 # One or more IMAP mailboxes to watch. Add as many accounts as you like.
 accounts:
   - name: primary                # label shown in notifications/logs
@@ -34,6 +48,7 @@ accounts:
     mailbox: INBOX
     mark_seen: false              # true = mark mail \Seen after notifying
     notify_existing: false        # false = only notify mail arriving after startup
+    # preview_len: 120             # optional: override global preview length
     # notifiers: [telegram]        # optional: override global notifiers per account
     # message_template:            # optional: per-account message template
     #   title: "{{.Subject}}"
